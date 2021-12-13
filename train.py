@@ -7,17 +7,18 @@ import cv2
 import torch.nn.functional as F
 from torch.autograd import Variable
 import pandas as pd
-import os ,torch
+import os,torch
 import torch.nn as nn
-import image_utils
+from util import image_utils
 import argparse,random
+from model.resnet import resnet18
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--raf_path', type=str, default='/data/ljj/FER/RAF', help='Raf-DB dataset path.')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Pytorch checkpoint file path')
-    parser.add_argument('--pretrained', type=str, default=None,
+    parser.add_argument('--pretrained', type=str, default='/data/ljj/project/RAN/checkpoint/ijba_res18_naive.pth.tar',
                         help='Pretrained weights')
     parser.add_argument('--beta', type=float, default=0.7, help='Ratio of high importance group in one mini-batch.')
     parser.add_argument('--relabel_epoch', type=int, default=10, help='Relabeling samples on each mini-batch after 10(Default) epochs.')
@@ -40,7 +41,7 @@ class RafDataSet(data.Dataset):
 
         NAME_COLUMN = 0
         LABEL_COLUMN = 1
-        df = pd.read_csv(os.path.join(self.raf_path, 'EmoLabel/list_patition_label.txt'), sep=' ', header=None)
+        df = pd.read_csv(os.path.join(self.raf_path, 'list_patition_label.txt'), sep=' ', header=None)
         if phase == 'train':
             dataset = df[df[NAME_COLUMN].str.startswith('train')]
         else:
@@ -53,7 +54,7 @@ class RafDataSet(data.Dataset):
         for f in file_names:
             f = f.split(".")[0]
             f = f +"_aligned.jpg"
-            path = os.path.join(self.raf_path, 'Image/aligned', f)
+            path = os.path.join(self.raf_path, 'aligned', f)
             self.file_paths.append(path)
         
         self.basic_aug = basic_aug
@@ -132,8 +133,8 @@ def initialize_weight_goog(m, n=''):
 def run_training():
 
     args = parse_args()
-    imagenet_pretrained = True
-    res18 = Res18Feature(pretrained = imagenet_pretrained, drop_rate = args.drop_rate) 
+    imagenet_pretrained = False
+    res18 = resnet18(pretrained = imagenet_pretrained, drop_rate = args.drop_rate) 
     if not imagenet_pretrained:
          for m in res18.modules():
             initialize_weight_goog(m)
@@ -149,7 +150,8 @@ def run_training():
             if  ((key=='module.fc.weight')|(key=='module.fc.bias')):
                 pass
             else:    
-                model_state_dict[key] = pretrained_state_dict[key]
+                new_key = key[7:]
+                model_state_dict[new_key] = pretrained_state_dict[key]
                 total_keys+=1
                 if key in model_state_dict:
                     loaded_keys+=1
@@ -206,7 +208,7 @@ def run_training():
     margin_1 = args.margin_1
     margin_2 = args.margin_2
     beta = args.beta
-    
+    best_acc = 0
     for i in range(1, args.epochs + 1):
         running_loss = 0.0
         correct_sum = 0
@@ -284,11 +286,12 @@ def run_training():
             acc = np.around(acc.numpy(),4)
             print("[Epoch %d] Validation accuracy:%.4f. Loss:%.3f" % (i, acc, running_loss))
            
-            if acc > 0.87 :
+            if acc > 0.87 and acc > best_acc:
+                best_acc = acc
                 torch.save({'iter': i,
                             'model_state_dict': res18.state_dict(),
                              'optimizer_state_dict': optimizer.state_dict(),},
-                            os.path.join('models', "epoch"+str(i)+"_acc"+str(acc)+".pth"))
+                            os.path.join('checkpoints', "epoch"+str(i)+"_acc"+str(acc)+".pth"))
                 print('Model saved.')
      
             
