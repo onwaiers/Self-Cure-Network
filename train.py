@@ -293,6 +293,7 @@ def run_training():
                              'optimizer_state_dict': optimizer.state_dict(),},
                             os.path.join('checkpoints', "epoch"+str(i)+"_acc"+str(acc)+".pth"))
                 print('Model saved.')
+            print('best acc:', best_acc)
      
             
 if __name__ == "__main__":                    
