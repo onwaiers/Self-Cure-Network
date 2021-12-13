@@ -14,7 +14,7 @@ import argparse,random
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--raf_path', type=str, default='datasets/raf-basic/', help='Raf-DB dataset path.')
+    parser.add_argument('--raf_path', type=str, default='/data/ljj/FER/RAF', help='Raf-DB dataset path.')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Pytorch checkpoint file path')
     parser.add_argument('--pretrained', type=str, default=None,
