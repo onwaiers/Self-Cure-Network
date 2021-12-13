@@ -294,6 +294,7 @@ def run_training():
                             os.path.join('checkpoints', "epoch"+str(i)+"_acc"+str(acc)+".pth"))
                 print('Model saved.')
             print('best acc:', best_acc)
+            print("test!")
      
             
 if __name__ == "__main__":                    
