@@ -1,17 +1,29 @@
 import math
 import numpy as np
 import torchvision.models as models
-import torch.utils.data as data
 from torchvision import transforms
 import cv2
 import torch.nn.functional as F
 from torch.autograd import Variable
 import pandas as pd
-import os,torch
+import os
+import shutil
+import torch
+import datetime
 import torch.nn as nn
 from util import image_utils
-import argparse,random
+import argparse
+import random
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
 from model.resnet import resnet18
+from util.plot_util import plot_confusion_matrix
+from util.common_util import initialize_weight_goog
+from util.raf_dataset_util import RAFDataSet
+from util.common_util import AverageMeter, ProgressMeter, RecorderMeter
+
+now = datetime.datetime.now()
+time_str = now.strftime("[%m-%d]-[%H-%M]-")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -31,114 +43,32 @@ def parse_args():
     parser.add_argument('--workers', default=4, type=int, help='Number of data loading workers (default: 4)')
     parser.add_argument('--epochs', type=int, default=70, help='Total training epochs.')
     parser.add_argument('--drop_rate', type=float, default=0, help='Drop out rate.')
+    parser.add_argument('-p', '--print-freq', default=10, type=int, metavar='N', help='print frequency')
+    parser.add_argument('--cm_path', type=str, default='./log/' + time_str + 'cm.png')        
+    parser.add_argument('--best_cm_path', type=str, default='./log/' + time_str + 'best_cm.png')
+    parser.add_argument('--checkpoint_path', type=str, default='./checkpoints/' + time_str + 'model.pth')
+    parser.add_argument('--best_checkpoint_path', type=str, default='./checkpoints/'+time_str+'model_best.pth')
     return parser.parse_args()
     
-class RafDataSet(data.Dataset):
-    def __init__(self, raf_path, phase, transform = None, basic_aug = False):
-        self.phase = phase
-        self.transform = transform
-        self.raf_path = raf_path
-
-        NAME_COLUMN = 0
-        LABEL_COLUMN = 1
-        df = pd.read_csv(os.path.join(self.raf_path, 'list_patition_label.txt'), sep=' ', header=None)
-        if phase == 'train':
-            dataset = df[df[NAME_COLUMN].str.startswith('train')]
-        else:
-            dataset = df[df[NAME_COLUMN].str.startswith('test')]
-        file_names = dataset.iloc[:, NAME_COLUMN].values
-        self.label = dataset.iloc[:, LABEL_COLUMN].values - 1 # 0:Surprise, 1:Fear, 2:Disgust, 3:Happiness, 4:Sadness, 5:Anger, 6:Neutral
-        
-        self.file_paths = []
-        # use raf aligned images for training/testing
-        for f in file_names:
-            f = f.split(".")[0]
-            f = f +"_aligned.jpg"
-            path = os.path.join(self.raf_path, 'aligned', f)
-            self.file_paths.append(path)
-        
-        self.basic_aug = basic_aug
-        self.aug_func = [image_utils.flip_image,image_utils.add_gaussian_noise]
-
-    def __len__(self):
-        return len(self.file_paths)
-
-    def __getitem__(self, idx):
-        path = self.file_paths[idx]
-        image = cv2.imread(path)
-        image = image[:, :, ::-1] # BGR to RGB
-        label = self.label[idx]
-        # augmentation
-        if self.phase == 'train':
-            if self.basic_aug and random.uniform(0, 1) > 0.5:
-                index = random.randint(0,1)
-                image = self.aug_func[index](image)
-
-        if self.transform is not None:
-            image = self.transform(image)
-        
-        return image, label, idx
-
-class Res18Feature(nn.Module):
-    def __init__(self, pretrained = True, num_classes = 7, drop_rate = 0):
-        super(Res18Feature, self).__init__()
-        self.drop_rate = drop_rate
-        resnet  = models.resnet18(pretrained)
-        # self.feature = nn.Sequential(*list(resnet.children())[:-2]) # before avgpool
-        self.features = nn.Sequential(*list(resnet.children())[:-1]) # after avgpool 512x1
-
-        fc_in_dim = list(resnet.children())[-1].in_features # original fc layer's in dimention 512
-   
-        self.fc = nn.Linear(fc_in_dim, num_classes) # new fc layer 512x7
-        self.alpha = nn.Sequential(nn.Linear(fc_in_dim, 1),nn.Sigmoid())
-
-    def forward(self, x):
-        x = self.features(x)
-        
-        if self.drop_rate > 0:
-            x =  nn.Dropout(self.drop_rate)(x)
-        x = x.view(x.size(0), -1)
-        
-        attention_weights = self.alpha(x)
-        out = attention_weights * self.fc(x)
-        return attention_weights, out
-        
-def initialize_weight_goog(m, n=''):
-    # weight init as per Tensorflow Official impl
-    # https://github.com/tensorflow/tpu/blob/master/models/official/mnasnet/mnasnet_model.py
-    # if isinstance(m, CondConv2d):
-        # fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-        # init_weight_fn = get_condconv_initializer(
-            # lambda w: w.data.normal_(0, math.sqrt(2.0 / fan_out)), m.num_experts, m.weight_shape)
-        # init_weight_fn(m.weight)
-        # if m.bias is not None:
-            # m.bias.data.zero_()
-    if isinstance(m, nn.Conv2d):
-        fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-        m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
-        if m.bias is not None:
-            m.bias.data.zero_()
-    elif isinstance(m, nn.BatchNorm2d):
-        m.weight.data.fill_(1.0)
-        m.bias.data.zero_()
-    elif isinstance(m, nn.Linear):
-        fan_out = m.weight.size(0)  # fan-out
-        fan_in = 0
-        if 'routing_fn' in n:
-            fan_in = m.weight.size(1)
-        init_range = 1.0 / math.sqrt(fan_in + fan_out)
-        m.weight.data.uniform_(-init_range, init_range)
-        m.bias.data.zero_()
+     
+args = parse_args()
+print('--------args----------')
+for k in list(vars(args).keys()):
+    print('%s: %s' % (k, vars(args)[k]))
+print('--------args----------\n')
+best_acc = 0
         
 def run_training():
 
-    args = parse_args()
     imagenet_pretrained = False
     res18 = resnet18(pretrained = imagenet_pretrained, drop_rate = args.drop_rate) 
+    
+    # init weight
     if not imagenet_pretrained:
          for m in res18.modules():
             initialize_weight_goog(m)
-            
+
+    # load weights of the pretrained model       
     if args.pretrained:
         print("Loading pretrained weights...", args.pretrained) 
         pretrained = torch.load(args.pretrained)
@@ -158,7 +88,8 @@ def run_training():
         print("Loaded params num:", loaded_keys)
         print("Total params num:", total_keys)
         res18.load_state_dict(model_state_dict, strict = False)  
-        
+    
+    # data_transforms
     data_transforms = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((224, 224)),
@@ -167,7 +98,7 @@ def run_training():
                                  std=[0.229, 0.224, 0.225]),
         transforms.RandomErasing(scale=(0.02,0.25))])
     
-    train_dataset = RafDataSet(args.raf_path, phase = 'train', transform = data_transforms, basic_aug = True)    
+    train_dataset = RAFDataSet(args.raf_path, phase = 'train', transform = data_transforms, basic_aug = True)    
     
     print('Train set size:', train_dataset.__len__())
     train_loader = torch.utils.data.DataLoader(train_dataset,
@@ -182,7 +113,7 @@ def run_training():
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])])                                           
-    val_dataset = RafDataSet(args.raf_path, phase = 'test', transform = data_transforms_val)    
+    val_dataset = RAFDataSet(args.raf_path, phase = 'test', transform = data_transforms_val)    
     print('Validation set size:', val_dataset.__len__())
     
     val_loader = torch.utils.data.DataLoader(val_dataset,
@@ -202,100 +133,207 @@ def run_training():
         raise ValueError("Optimizer not supported.")
     
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.9)
+    recorder = RecorderMeter(args.epochs)
     res18 = res18.cuda()
     criterion = torch.nn.CrossEntropyLoss()
     
+    # margin_1 = args.margin_1
+    # margin_2 = args.margin_2
+    # beta = args.beta
+
+    # 记录训练时的参数值
+    txt_name = './log/' + time_str + 'log.txt'
+    with open(txt_name, 'a') as f:
+        f.write('--------args----------\n')
+        for k in list(vars(args).keys()):
+            f.write('%s: %s\n' % (k, vars(args)[k]))
+        f.write('--------args----------\n')  
+
+    for i in range(0, args.epochs):
+        train_acc, train_los = train(train_loader, res18, criterion, optimizer, scheduler, i)
+        val_acc, val_los = validate(val_loader, res18, criterion, optimizer, i)
+
+        recorder.update(i, train_los, train_acc, val_los, val_acc)
+        curve_name = time_str + 'cnn.png'
+        recorder.plot_curve(os.path.join('./log/', curve_name))
+
+        print('Current best accuracy: ', best_acc)
+        txt_name = './log/' + time_str + 'log.txt'
+        with open(txt_name, 'a') as f:
+            f.write('Current best accuracy: ' + str(best_acc) + '\n')
+        
+     
+def train(train_loader, model, criterion, optimizer, scheduler, epoch):
+    running_loss = 0.0
+    correct_sum = 0
+    iter_cnt = 0
+    losses = AverageMeter('Loss', ':.4f')
+    top1 = AverageMeter('Accuracy', ':6.3f')
+    progress = ProgressMeter(len(train_loader),
+                             [losses, top1],
+                             time_str,
+                             prefix="Epoch: [{}]".format(epoch))
     margin_1 = args.margin_1
     margin_2 = args.margin_2
     beta = args.beta
-    best_acc = 0
-    for i in range(1, args.epochs + 1):
-        running_loss = 0.0
-        correct_sum = 0
-        iter_cnt = 0
-        res18.train()
-        for batch_i, (imgs, targets, indexes) in enumerate(train_loader):
-            batch_sz = imgs.size(0) 
-            iter_cnt += 1
-            tops = int(batch_sz* beta)
-            optimizer.zero_grad()
-            imgs = imgs.cuda()
-            attention_weights, outputs = res18(imgs)
-            
-            # Rank Regularization
-            _, top_idx = torch.topk(attention_weights.squeeze(), tops)
-            _, down_idx = torch.topk(attention_weights.squeeze(), batch_sz - tops, largest = False)
 
-            high_group = attention_weights[top_idx]
-            low_group = attention_weights[down_idx]
-            high_mean = torch.mean(high_group)
-            low_mean = torch.mean(low_group)
-            # diff  = margin_1 - (high_mean - low_mean)
-            diff  = low_mean - high_mean + margin_1
-
-            if diff > 0:
-                RR_loss = diff
-            else:
-                RR_loss = 0.0
-            
-            targets = targets.cuda()
-            loss = criterion(outputs, targets) + RR_loss 
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss
-            _, predicts = torch.max(outputs, 1)
-            correct_num = torch.eq(predicts, targets).sum()
-            correct_sum += correct_num
-
-            # Relabel samples
-            if i >= args.relabel_epoch:
-                sm = torch.softmax(outputs, dim = 1)
-                Pmax, predicted_labels = torch.max(sm, 1) # predictions
-                Pgt = torch.gather(sm, 1, targets.view(-1,1)).squeeze() # retrieve predicted probabilities of targets
-                true_or_false = Pmax - Pgt > margin_2
-                update_idx = true_or_false.nonzero().squeeze() # get samples' index in this mini-batch where (Pmax - Pgt > margin_2)
-                label_idx = indexes[update_idx] # get samples' index in train_loader
-                relabels = predicted_labels[update_idx] # predictions where (Pmax - Pgt > margin_2)
-                train_loader.dataset.label[label_idx.cpu().numpy()] = relabels.cpu().numpy() # relabel samples in train_loader
-                
-        scheduler.step()
-        acc = correct_sum.float() / float(train_dataset.__len__())
-        running_loss = running_loss/iter_cnt
-        print('[Epoch %d] Training accuracy: %.4f. Loss: %.3f' % (i, acc, running_loss))
+    model.train()
+    for batch_i, (imgs, targets, indexes) in enumerate(train_loader):
+        batch_sz = imgs.size(0) 
+        iter_cnt += 1
+        tops = int(batch_sz * beta)
+        optimizer.zero_grad()
+        imgs = imgs.cuda()
+        attention_weights, outputs = model(imgs)
         
-        with torch.no_grad():
-            running_loss = 0.0
-            iter_cnt = 0
-            bingo_cnt = 0
-            sample_cnt = 0
-            res18.eval()
-            for batch_i, (imgs, targets, _) in enumerate(val_loader):
-                _, outputs = res18(imgs.cuda())
-                targets = targets.cuda()
-                loss = criterion(outputs, targets)
-                running_loss += loss
-                iter_cnt+=1
-                _, predicts = torch.max(outputs, 1)
-                correct_num  = torch.eq(predicts,targets)
-                bingo_cnt += correct_num.sum().cpu()
-                sample_cnt += outputs.size(0)
-                
-            running_loss = running_loss/iter_cnt   
-            acc = bingo_cnt.float()/float(sample_cnt)
-            acc = np.around(acc.numpy(),4)
-            print("[Epoch %d] Validation accuracy:%.4f. Loss:%.3f" % (i, acc, running_loss))
-           
-            if acc > 0.87 and acc > best_acc:
-                best_acc = acc
-                torch.save({'iter': i,
-                            'model_state_dict': res18.state_dict(),
-                             'optimizer_state_dict': optimizer.state_dict(),},
-                            os.path.join('checkpoints', "epoch"+str(i)+"_acc"+str(acc)+".pth"))
-                print('Model saved.')
-            print('best acc:', best_acc)
-            print("test!")
-     
+        # Rank Regularization
+        _, top_idx = torch.topk(attention_weights.squeeze(), tops)
+        _, down_idx = torch.topk(attention_weights.squeeze(), batch_sz - tops, largest = False)
+
+        high_group = attention_weights[top_idx]
+        low_group = attention_weights[down_idx]
+        high_mean = torch.mean(high_group)
+        low_mean = torch.mean(low_group)
+        # diff  = margin_1 - (high_mean - low_mean)
+        diff  = low_mean - high_mean + margin_1
+
+        if diff > 0:
+            RR_loss = diff
+        else:
+            RR_loss = 0.0
+        
+        targets = targets.cuda()
+        loss = criterion(outputs, targets) + RR_loss 
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss
+        _, predicts = torch.max(outputs, 1)
+        correct_num = torch.eq(predicts, targets).sum()
+        correct_sum += correct_num
+
+        prec1 = accuracy(outputs.data, targets, topk=(1,))
+        losses.update(loss.item(), imgs.size(0))
+        top1.update(prec1[0].item(), imgs.size(0))
+
+        if batch_i % args.print_freq == 0:
+            progress.display(batch_i)
+
+
+        # Relabel samples
+        if epoch >= args.relabel_epoch:
+            sm = torch.softmax(outputs, dim = 1)
+            Pmax, predicted_labels = torch.max(sm, 1) # predictions
+            Pgt = torch.gather(sm, 1, targets.view(-1,1)).squeeze() # retrieve predicted probabilities of targets
+            true_or_false = Pmax - Pgt > margin_2
+            update_idx = true_or_false.nonzero().squeeze() # get samples' index in this mini-batch where (Pmax - Pgt > margin_2)
+            label_idx = indexes[update_idx] # get samples' index in train_loader
+            relabels = predicted_labels[update_idx] # predictions where (Pmax - Pgt > margin_2)
+            train_loader.dataset.label[label_idx.cpu().numpy()] = relabels.cpu().numpy() # relabel samples in train_loader
             
+    scheduler.step()
+    acc = correct_sum.float() / float(train_loader.dataset.__len__())
+    running_loss = running_loss/iter_cnt
+    print('[Epoch %d] Training accuracy: %.4f. Loss: %.3f' % (epoch, acc, running_loss))
+    txt_name = './log/' + time_str + 'log.txt'
+    with open(txt_name, 'a') as f:
+        f.write('[Epoch %d] Training accuracy: %.4f. Loss: %.3f\n' % (epoch, acc, running_loss))
+    return top1.avg, losses.avg
+
+def validate(val_loader, model, criterion, optimizer, epoch):
+    global best_acc
+    with torch.no_grad():
+        losses = AverageMeter('Loss', ':.4f')
+        top1 = AverageMeter('Accuracy', ':6.3f')
+        progress = ProgressMeter(len(val_loader),
+                                [losses, top1],
+                                time_str,
+                                prefix='Test: ')
+        class_names = ['Surprise', 'Fear', 'Disgust', 'Happy', 'Sad', 'Anger', 'Neutral']
+
+        running_loss = 0.0
+        iter_cnt = 0
+        bingo_cnt = 0
+        sample_cnt = 0
+        model.eval()
+        for batch_i, (imgs, targets, _) in enumerate(val_loader):
+            _, outputs = model(imgs.cuda())
+            targets = targets.cuda()
+            loss = criterion(outputs, targets)
+            running_loss += loss
+            iter_cnt+=1
+            _, predicts = torch.max(outputs, 1)
+            correct_num  = torch.eq(predicts,targets)
+            bingo_cnt += correct_num.sum().cpu()
+            sample_cnt += outputs.size(0)
+
+            prec1 = accuracy(outputs.data, targets, topk=(1,))
+            losses.update(loss.item(), imgs.size(0))
+            top1.update(prec1[0].item(), imgs.size(0))
+            
+            _, predicted = torch.max(outputs.data, 1)
+            if batch_i == 0:
+                all_predicted = predicted
+                all_targets = targets
+            else:
+                all_predicted = torch.cat((all_predicted, predicted),0)
+                all_targets = torch.cat((all_targets, targets),0)
+            
+            if batch_i % args.print_freq == 0:
+                progress.display(batch_i)
+
+        running_loss = running_loss/iter_cnt   
+        acc = bingo_cnt.float()/float(sample_cnt)
+        acc = np.around(acc.numpy(),4)
+        print("[Epoch %d] Validation accuracy:%.4f. Loss:%.3f" % (epoch, acc, running_loss))
+
+        txt_name = './log/' + time_str + 'log.txt'
+        with open(txt_name, 'a') as f: 
+           f.write("[Epoch %d] Validation accuracy:%.4f. Loss:%.3f\n" % (epoch, acc, running_loss)) 
+
+        is_best = acc > best_acc
+        if acc > best_acc:
+            best_acc = acc
+
+
+        save_checkpoint({'epoch': epoch + 1,
+                         'state_dict': model.state_dict(),
+                         'best_acc': best_acc,
+                         'optimizer': optimizer.state_dict()},
+                        is_best, args)
+
+        # Compute confusion matrix
+        matrix = confusion_matrix(all_targets.data.cpu().numpy(), all_predicted.cpu().numpy())
+        np.set_printoptions(precision=2)
+
+        # Plot normalized confusion matrix
+        plt.figure(figsize=(10, 8))
+        plot_confusion_matrix(matrix, classes=class_names, normalize=True,
+                            title= ' Confusion Matrix (Accuracy: %.3f%%)'%(top1.avg))
+        plt.savefig(args.cm_path)
+        if is_best:
+            shutil.copyfile(args.cm_path, args.best_cm_path)
+        plt.close()
+
+        return top1.avg, losses.avg
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+def save_checkpoint(state, is_best, args):
+    torch.save(state, args.checkpoint_path)
+    if is_best:
+        shutil.copyfile(args.checkpoint_path, args.best_checkpoint_path)
 if __name__ == "__main__":                    
     run_training()
